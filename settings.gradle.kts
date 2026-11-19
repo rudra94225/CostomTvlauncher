@@ -13,4 +13,4 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "TvOSNative"
-include(":app")
+include(":apps")
