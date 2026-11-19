@@ -64,7 +64,7 @@ jobs:
           fi
 
           mkdir -p release_out
-          APK_SOURCE=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          APK_SOURCE=$(find apps/build/outputs/apk/release -name "*.apk" | head -n 1)
           if [ -z "$APK_SOURCE" ]; then
             echo "Error: No release APK found"
             exit 1
