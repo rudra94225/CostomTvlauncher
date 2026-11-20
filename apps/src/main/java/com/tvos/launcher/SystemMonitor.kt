@@ -8,18 +8,17 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.net.ConnectivityManager
-import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
-import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -75,7 +74,7 @@ object SystemMonitor {
 
     @Volatile var cachedWeather: WeatherReport? = null
 
-    // ---------------- REAL-TIME RAM ----------------
+    // ---------------- ON-DEMAND READ-ONLY MEMORY INFO (SETTINGS -> SYSTEM) ----------------
     fun getRamInfo(context: Context): RamInfo {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val mi = ActivityManager.MemoryInfo()
@@ -87,21 +86,39 @@ object SystemMonitor {
         return RamInfo(usedMb, totalMb, freeMb, pct)
     }
 
-    fun trimRam(context: Context): Long {
-        val before = getRamInfo(context).freeMb
-        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        try {
-            val apps = context.packageManager.getInstalledApplications(0)
-            for (app in apps) {
-                if (app.packageName != context.packageName) {
-                    am.killBackgroundProcesses(app.packageName)
-                }
+    // ---------------- SYSTEM SETTINGS PANELS (PERSISTENT ANDROID 10+ NETWORK/BT) ----------------
+    fun openSystemWifiSettings(context: Context): Boolean {
+        val candidates = mutableListOf<Intent>().apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                add(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY))
+                add(Intent(Settings.Panel.ACTION_WIFI))
             }
-        } catch (_: Exception) {}
-        TvIconComposer.clearCache()
-        System.gc()
-        val after = getRamInfo(context).freeMb
-        return (after - before).coerceAtLeast(0L)
+            add(Intent(Settings.ACTION_WIFI_SETTINGS))
+            add(Intent(Settings.ACTION_SETTINGS))
+        }
+        for (intent in candidates) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+                return true
+            } catch (_: Exception) {}
+        }
+        return false
+    }
+
+    fun openSystemBluetoothSettings(context: Context): Boolean {
+        val candidates = listOf(
+            Intent(Settings.ACTION_BLUETOOTH_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS)
+        )
+        for (intent in candidates) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+                return true
+            } catch (_: Exception) {}
+        }
+        return false
     }
 
     // ---------------- WI-FI ----------------
@@ -189,6 +206,13 @@ object SystemMonitor {
         }
     }
 
+    /**
+     * Connects persistently to Wi-Fi:
+     * - On Android 10+ (API 29+), WifiNetworkSpecifier only creates a temporary local-only
+     *   connection scoped to this process (dropping the instant YouTube/Prime launches).
+     *   Route directly to Android's native Network/Wi-Fi Settings panel for persistent internet.
+     * - On Android 9 and below, connect natively via WifiConfiguration.
+     */
     @Suppress("DEPRECATION")
     @SuppressLint("MissingPermission")
     fun connectToWifi(
@@ -199,49 +223,32 @@ object SystemMonitor {
         onResult: (Boolean, String) -> Unit
     ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                val builder = WifiNetworkSpecifier.Builder().setSsid(ssid)
-                if (secured && !password.isNullOrEmpty()) builder.setWpa2Passphrase(password)
-                val req = NetworkRequest.Builder()
-                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                    .setNetworkSpecifier(builder.build())
-                    .build()
-                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-                cm.requestNetwork(req, object : ConnectivityManager.NetworkCallback() {
-                    override fun onAvailable(network: Network) {
-                        cm.bindProcessToNetwork(network)
-                        onResult(true, "Connected to $ssid")
-                    }
-                    override fun onUnavailable() {
-                        onResult(false, "Could not connect to $ssid")
-                    }
-                })
-            } catch (e: Exception) {
-                onResult(false, e.message ?: "Connection failed")
-            }
-        } else {
-            try {
-                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                val cfg = WifiConfiguration().apply {
-                    SSID = "\"$ssid\""
-                    if (secured && !password.isNullOrEmpty()) {
-                        preSharedKey = "\"$password\""
-                    } else {
-                        allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE)
-                    }
-                }
-                val netId = wm.addNetwork(cfg)
-                if (netId != -1) {
-                    wm.disconnect()
-                    wm.enableNetwork(netId, true)
-                    wm.reconnect()
-                    onResult(true, "Connecting to $ssid...")
+            val opened = openSystemWifiSettings(context)
+            onResult(opened, if (opened) "Select $ssid in System Wi-Fi" else "Open Android Wi-Fi Settings")
+            return
+        }
+
+        try {
+            val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val cfg = WifiConfiguration().apply {
+                SSID = "\"$ssid\""
+                if (secured && !password.isNullOrEmpty()) {
+                    preSharedKey = "\"$password\""
                 } else {
-                    onResult(false, "Failed to save Wi-Fi config")
+                    allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE)
                 }
-            } catch (e: Exception) {
-                onResult(false, e.message ?: "Connection failed")
             }
+            val netId = wm.addNetwork(cfg)
+            if (netId != -1) {
+                wm.disconnect()
+                wm.enableNetwork(netId, true)
+                wm.reconnect()
+                onResult(true, "Connecting to $ssid...")
+            } else {
+                onResult(false, "Failed to save Wi-Fi config")
+            }
+        } catch (e: Exception) {
+            onResult(false, e.message ?: "Connection failed")
         }
     }
 
@@ -256,6 +263,9 @@ object SystemMonitor {
     fun toggleBluetooth(context: Context): ToggleResult {
         val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val adapter = bm?.adapter ?: return ToggleResult.SYSTEM_RESTRICTED
+        if (Build.VERSION.SDK_INT >= 33) {
+            return ToggleResult.SYSTEM_RESTRICTED
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
                 return ToggleResult.SYSTEM_RESTRICTED
@@ -414,7 +424,7 @@ object SystemMonitor {
             } catch (_: Exception) {}
         }
         mainHandler.postDelayed({
-            if (!acted) onDone(false, "Signal sent to ${device.name ?: "device"}")
+            if (!acted) onDone(false, "Opening Bluetooth Settings...")
         }, 1200L)
     }
 
